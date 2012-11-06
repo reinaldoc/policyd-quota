@@ -1,0 +1,150 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+# Quota Policy Daemon for Postfix
+# Copyright (c) 2007-2008 -  Reinaldo Carvalho <reinaldoc@gmail.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.
+
+import sys, syslog, imaplib, ldap
+
+Commands = {
+    'DUMP'         : ('AUTH',)
+    }
+imaplib.Commands.update(Commands)
+
+class IMAP4(imaplib.IMAP4):
+    def isadmin(self):
+        try:
+            res, msg = self._simple_command('DUMP', 'NIL')
+            if msg[0].lower().find('denied') == -1:
+                return True
+        except:
+            pass
+        return False
+
+class IMAP4_SSL(imaplib.IMAP4_SSL):
+    def isadmin(self):
+        try:
+            res, msg = self._simple_command('DUMP', 'NIL')
+            if msg[0].lower().find('denied') == -1:
+                return True
+        except:
+            pass
+        return False
+
+def ldap_connect():
+    try:
+#        if self.cLdapCert.isChecked():
+         ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT,0)
+#        if self.cLdapRef.isChecked():
+#         ldap.set_option(ldap.OPT_REFERRALS,1)
+#        else:
+         ldap.set_option(ldap.OPT_REFERRALS,0)
+         l = ldap.initialize("ldap://127.0.0.1:389")
+         l.protocol_version = ldap.VERSION3
+         l.simple_bind()
+         return l
+    except ldap.LDAPError, e:
+         syslog.syslog("Error conectando no ldap.")
+
+def ldap_search(filter="objectClass=*",attrs=None):
+   try:
+        l = ldap_connect()
+        ldap_result_id = l.search("ou=users,dc=example,dc=br", ldap.SCOPE_SUBTREE, filter, attrs)
+        ldap_result = {}
+        while 1:
+           result_type, result_data = l.result(ldap_result_id, 0)
+           if result_type == ldap.RES_SEARCH_RESULT:
+               break
+           elif result_type == ldap.RES_SEARCH_ENTRY:
+               ldap_result[result_data[0][0]] = result_data[0][1]
+           elif result_type == ldap.RES_SEARCH_REFERENCE:
+               ldap_result[result_data[0][1][0].split("/")[3].split("?")[0]] = {'ref': [result_data[0][1][0]]}
+           else:
+               syslog.syslog("Result type not implemented. "+str(result_type))
+        return ldap_result
+   except ldap.LDAPError, e:
+       syslog.syslog("Error consultando ldap.")
+
+def ldap_expand_alias(mailAlternateAddress):
+    ldap_result = ldap_search('(mailAlternateAddress=%s)' % mailAlternateAddress, ["mail"])
+    entries = len(ldap_result.keys())
+    if entries == 0:
+        return mailAlternateAddress
+    elif entries > 0:
+        if entries > 1:
+            syslog.syslog("Aviso: mais de um registro possui o alias: %s" % mailAlternateAddress)
+        for dn in ldap_result.keys():
+            return ldap_result[dn]['mail'][0]
+            break
+
+def imap_connect(m=None):
+    try:
+        if m.state == 'AUTH':
+            return m
+    except AttributeError, e:
+        try:
+            m = IMAP4("127.0.0.1",143)
+            m.login("cyrus@example.com","xxxx")[0]
+            if m.isadmin():
+#                print "Conectado com sucesso."
+                return m
+            else:
+                m.logout()
+#                print "Usuário não possui direito de administrador"
+        except IMAP4.error, e:
+            pass
+#            print "Usuário ou senha inválidos."
+
+def main():
+
+    syslog.openlog("policyd-quota", syslog.LOG_PID, syslog.LOG_MAIL)
+    m = imap_connect()
+    action="DUNNO"
+
+    while 1:
+        line = sys.stdin.readline()
+        if not line:
+            sys.exit(0)
+
+        if not line.strip('\n'):
+            sys.stdout.write("action="+action+"\n\n")
+            action="DUNNO"
+            sys.stdout.flush()
+
+        else:
+            linelist=line.split("=")
+            if linelist[0] == "recipient":
+               emaillist = linelist[1].strip('\n').split("@")
+               if emaillist[1] == "example.com":
+                   emailexpandlist=ldap_expand_alias("@".join(emaillist)).split("@")
+                   if emailexpandlist[1] == "example.com":
+                       quota = m.getquota("user/"+emailexpandlist[0])
+                       if quota[0] == "OK":
+                           value=quota[1][0].split(" ")
+                           quota_used = int(value[2])
+                           quota_limit = int(value[3].split(")")[0])
+                           if (quota_used * 100 / quota_limit) > 95:
+                               action="reject User over quota"
+                               if emaillist != emailexpandlist:
+                                   msg='(mailbox: '+"@".join(emailexpandlist)+') '
+                               else:
+                                   msg=''
+                               syslog.syslog(emaillist[0]+'@'+emaillist[1]+' '+msg+'with over quota '+str(quota_used)+'/'+str(quota_limit)+'.')
+            #('OK', ['user/account (STORAGE 254207 62914560)'])
+            #('NO', ['Quota root does not exist'])
+
+if __name__ == "__main__":
+    main()
